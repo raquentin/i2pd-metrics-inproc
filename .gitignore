@@ -1,0 +1,6 @@
+*.o
+obj/
+tests/test_main
+tests/test_renderer
+tests/test_all
+tests/stubs.o

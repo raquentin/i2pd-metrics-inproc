@@ -1,0 +1,883 @@
+diff --git a/Makefile b/Makefile
+index 33f3365a..46f7c17b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -94,6 +94,7 @@ mk_obj_dir:
+ 	@mkdir -p obj/$(LIB_CLIENT_SRC_DIR)
+ 	@mkdir -p obj/$(LANG_SRC_DIR)
+ 	@mkdir -p obj/$(DAEMON_SRC_DIR)
++	@mkdir -p obj/$(DAEMON_SRC_DIR)/collectors
+ 	@mkdir -p obj/$(WRAP_SRC_DIR)
+ 	@mkdir -p obj/Win32
+ 
+diff --git a/contrib/i2pd.conf b/contrib/i2pd.conf
+index c5c32959..8811a673 100644
+--- a/contrib/i2pd.conf
++++ b/contrib/i2pd.conf
+@@ -288,3 +288,13 @@ verify = true
+ ## Save full addresses on disk (default: true)
+ # addressbook = true
+ 
++
++
++## Prometheus/OpenMetrics endpoint
++[metrics]
++## Enable Prometheus/OpenMetrics endpoint (default: false)
++# enabled = false
++## Metrics listen address (default: 127.0.0.1)
++# address = 127.0.0.1
++## Metrics listen port (default: 9600)
++# port = 9600
+diff --git a/daemon/Daemon.cpp b/daemon/Daemon.cpp
+index fef05cbf..136b89ff 100644
+--- a/daemon/Daemon.cpp
++++ b/daemon/Daemon.cpp
+@@ -28,6 +28,7 @@
+ #include "Destination.h"
+ #include "HTTPServer.h"
+ #include "I2PControl.h"
++#include "Metrics.h"
+ #include "ClientContext.h"
+ #include "Crypto.h"
+ #include "UPnP.h"
+@@ -46,6 +47,7 @@ namespace util
+ 
+ 		std::unique_ptr<i2p::http::HTTPServer> httpServer;
+ 		std::unique_ptr<i2p::client::I2PControlService> m_I2PControlService;
++		std::unique_ptr<i2p::metrics::MetricsServer> metricsServer;
+ 		std::unique_ptr<i2p::transport::UPnP> UPnP;
+ 		std::unique_ptr<i2p::util::NTPTimeSync> m_NTPSync;
+ 	};
+@@ -382,6 +384,15 @@ namespace util
+ 				ThrowFatal ("Unable to start I2PControl service at ", i2pcpAddr, ":", i2pcpPort, ": ", ex.what ());
+ 			}
+ 		}
++		// start metrics server
++		bool metricsEnabled; i2p::config::GetOption("metrics.enabled", metricsEnabled);
++		if (metricsEnabled) {
++			std::string metricsAddr; i2p::config::GetOption("metrics.address", metricsAddr);
++			uint16_t metricsPort; i2p::config::GetOption("metrics.port", metricsPort);
++			LogPrint(eLogInfo, "Daemon: Starting Metrics at ", metricsAddr, ":", metricsPort);
++			d.metricsServer = std::unique_ptr<i2p::metrics::MetricsServer>(new i2p::metrics::MetricsServer(metricsAddr, metricsPort));
++			d.metricsServer->Start();
++		}
+ 		return true;
+ 	}
+ 
+@@ -422,6 +433,12 @@ namespace util
+ 			d.m_I2PControlService->Stop ();
+ 			d.m_I2PControlService = nullptr;
+ 		}
++		if (d.metricsServer)
++		{
++			LogPrint(eLogInfo, "Daemon: Stopping Metrics");
++			d.metricsServer->Stop();
++			d.metricsServer = nullptr;
++		}
+ 		i2p::crypto::TerminateCrypto ();
+ 		i2p::log::Logger().Stop();
+ 
+diff --git a/daemon/Metrics.cpp b/daemon/Metrics.cpp
+new file mode 100644
+index 00000000..07b07fd1
+--- /dev/null
++++ b/daemon/Metrics.cpp
+@@ -0,0 +1,150 @@
++#include "Metrics.h"
++#include "MetricsRenderer.h"
++#include "collectors/ClientCollector.h"
++#include "collectors/NetDbCollector.h"
++#include "collectors/RouterCollector.h"
++#include "collectors/TransportCollector.h"
++#include "collectors/TunnelCollector.h"
++#include <boost/beast/core.hpp>
++#include <boost/beast/http.hpp>
++#include <iostream>
++
++namespace beast = boost::beast;
++namespace http = beast::http;
++namespace net = boost::asio;
++using tcp = net::ip::tcp;
++
++namespace i2p {
++namespace metrics {
++MetricsServer::MetricsServer(const std::string &address, uint16_t port)
++    : m_Address(address), m_Port(port), m_IsRunning(false), m_Thread(nullptr),
++      m_Work(m_Service.get_executor()) {}
++
++MetricsServer::~MetricsServer() { Stop(); }
++
++void MetricsServer::Start() {
++  if (m_IsRunning)
++    return;
++
++  m_IsRunning = true;
++  m_Acceptor = std::make_unique<tcp::acceptor>(
++      m_Service, tcp::endpoint(net::ip::make_address(m_Address), m_Port));
++  m_Thread.reset(new std::thread(std::bind(&MetricsServer::Run, this)));
++  m_Acceptor->listen();
++  Accept();
++}
++
++void MetricsServer::Stop() {
++  if (!m_IsRunning)
++    return;
++
++  m_IsRunning = false;
++
++  if (m_Acceptor) {
++    boost::system::error_code ec;
++    m_Acceptor->cancel(ec);
++    m_Acceptor->close();
++  }
++
++  m_Service.stop();
++  if (m_Thread) {
++    m_Thread->join();
++    m_Thread = nullptr;
++  }
++}
++
++void MetricsServer::Run() {
++  while (m_IsRunning) {
++    try {
++      m_Service.run();
++    } catch (std::exception &ex) {
++      std::cerr << "MetricsServer: Runtime exception: " << ex.what()
++                << std::endl;
++    }
++  }
++}
++
++void MetricsServer::Accept() {
++  auto socket = std::make_shared<tcp::socket>(m_Service);
++  m_Acceptor->async_accept(*socket,
++                           std::bind(&MetricsServer::HandleAccept, this,
++                                     std::placeholders::_1, socket));
++}
++
++void MetricsServer::HandleAccept(const boost::system::error_code &ecode,
++                                 std::shared_ptr<tcp::socket> socket) {
++  if (!ecode) {
++    HandleRequest(socket);
++  } else {
++    if (socket)
++      socket->close();
++    std::cerr << "MetricsServer: Accept error: " << ecode.message()
++              << std::endl;
++  }
++
++  if (m_IsRunning)
++    Accept();
++}
++
++std::vector<MetricFamily> MetricsServer::CollectMetrics() {
++  std::vector<MetricFamily> families;
++
++  // Collect router metrics
++  CollectRouterMetrics(families);
++
++  // Collect tunnel metrics
++  CollectTunnelMetrics(families);
++
++  // Collect transport metrics
++  CollectTransportMetrics(families);
++
++  // Collect NetDb metrics
++  CollectNetDbMetrics(families);
++
++  // Collect client metrics
++  CollectClientMetrics(families);
++
++  return families;
++}
++
++void MetricsServer::HandleRequest(std::shared_ptr<tcp::socket> socket) {
++  auto buffer = std::make_shared<beast::flat_buffer>();
++  auto req = std::make_shared<http::request<http::string_body>>();
++
++  http::async_read(
++      *socket, *buffer, *req,
++      [this, socket, buffer, req](beast::error_code ec, std::size_t) {
++        if (ec) {
++          socket->close();
++          return;
++        }
++
++        auto res = std::make_shared<http::response<http::string_body>>();
++        res->version(req->version());
++        res->keep_alive(false);
++
++        if (req->target() == "/metrics") {
++          res->result(http::status::ok);
++          res->set(
++              http::field::content_type,
++              "application/openmetrics-text; version=1.0.0; charset=utf-8");
++          auto families = CollectMetrics();
++          res->body() = RenderOpenMetrics(families);
++        } else {
++          res->result(http::status::not_found);
++          res->set(http::field::content_type, "text/plain");
++          res->body() = "404 Not Found\n";
++        }
++
++        res->prepare_payload();
++
++        http::async_write(
++            *socket, *res, [socket, res](beast::error_code, std::size_t) {
++              beast::error_code shutdown_ec;
++              socket->shutdown(tcp::socket::shutdown_send, shutdown_ec);
++              socket->close();
++            });
++      });
++}
++} // namespace metrics
++} // namespace i2p
+diff --git a/daemon/Metrics.h b/daemon/Metrics.h
+new file mode 100644
+index 00000000..e51d2905
+--- /dev/null
++++ b/daemon/Metrics.h
+@@ -0,0 +1,43 @@
++#ifndef METRICS_H__
++#define METRICS_H__
++
++#include <boost/asio.hpp>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace i2p {
++namespace metrics {
++struct MetricFamily;
++
++class MetricsServer {
++public:
++  MetricsServer(const std::string &address, uint16_t port);
++  ~MetricsServer();
++
++  void Start();
++  void Stop();
++
++private:
++  void Run();
++  void Accept();
++  void HandleAccept(const boost::system::error_code &ecode,
++                    std::shared_ptr<boost::asio::ip::tcp::socket> socket);
++  void HandleRequest(std::shared_ptr<boost::asio::ip::tcp::socket> socket);
++  std::vector<MetricFamily> CollectMetrics();
++
++private:
++  std::string m_Address;
++  uint16_t m_Port;
++  bool m_IsRunning;
++  std::unique_ptr<std::thread> m_Thread;
++  boost::asio::io_context m_Service;
++  boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
++      m_Work;
++  std::unique_ptr<boost::asio::ip::tcp::acceptor> m_Acceptor;
++};
++} // namespace metrics
++} // namespace i2p
++
++#endif // METRICS_H__
+diff --git a/daemon/MetricsRenderer.cpp b/daemon/MetricsRenderer.cpp
+new file mode 100644
+index 00000000..77644c49
+--- /dev/null
++++ b/daemon/MetricsRenderer.cpp
+@@ -0,0 +1,73 @@
++#include "MetricsRenderer.h"
++#include <sstream>
++
++namespace i2p {
++namespace metrics {
++static std::string EscapeLabelValue(const std::string &value) {
++  std::string result;
++  result.reserve(value.size());
++  for (char c : value) {
++    if (c == '\\' || c == '"' || c == '\n') {
++      result += '\\';
++      if (c == '\n')
++        result += 'n';
++      else
++        result += c;
++    } else
++      result += c;
++  }
++  return result;
++}
++
++static std::string TypeToString(MetricType type) {
++  switch (type) {
++  case MetricType::Gauge:
++    return "gauge";
++  case MetricType::Counter:
++    return "counter";
++  case MetricType::Info:
++    return "info";
++  default:
++    return "unknown";
++  }
++}
++
++std::string RenderOpenMetrics(const std::vector<MetricFamily> &families) {
++  std::ostringstream oss;
++
++  for (const auto &family : families) {
++    // HELP line
++    oss << "# HELP " << family.name << " " << family.help << "\n";
++
++    // TYPE line
++    oss << "# TYPE " << family.name << " " << TypeToString(family.type) << "\n";
++
++    // Metrics
++    for (const auto &metric : family.metrics) {
++      oss << family.name;
++
++      // Labels
++      if (!metric.labels.empty()) {
++        oss << "{";
++        bool first = true;
++        for (const auto &label : metric.labels) {
++          if (!first)
++            oss << ",";
++          first = false;
++          oss << label.first << "=\"" << EscapeLabelValue(label.second) << "\"";
++        }
++        oss << "}";
++      }
++
++      // Value
++      oss << " " << metric.value << "\n";
++    }
++  }
++
++  // EOF marker
++  oss << "# EOF\n";
++
++  return oss.str();
++}
++} // namespace metrics
++} // namespace i2p
+diff --git a/daemon/MetricsRenderer.h b/daemon/MetricsRenderer.h
+new file mode 100644
+index 00000000..b454ec6f
+--- /dev/null
++++ b/daemon/MetricsRenderer.h
+@@ -0,0 +1,42 @@
++#ifndef METRICS_RENDERER_H__
++#define METRICS_RENDERER_H__
++
++#include <map>
++#include <string>
++#include <vector>
++
++namespace i2p {
++namespace metrics {
++enum class MetricType { Gauge, Counter, Info };
++
++struct Metric {
++  std::map<std::string, std::string> labels;
++  double value;
++
++  Metric(double val) : value(val) {}
++  Metric(const std::map<std::string, std::string> &lbls, double val)
++      : labels(lbls), value(val) {}
++};
++
++struct MetricFamily {
++  std::string name;
++  MetricType type;
++  std::string help;
++  std::vector<Metric> metrics;
++
++  MetricFamily(const std::string &n, MetricType t, const std::string &h)
++      : name(n), type(t), help(h) {}
++
++  void AddMetric(double value) { metrics.emplace_back(value); }
++
++  void AddMetric(const std::map<std::string, std::string> &labels,
++                 double value) {
++    metrics.emplace_back(labels, value);
++  }
++};
++
++std::string RenderOpenMetrics(const std::vector<MetricFamily> &families);
++} // namespace metrics
++} // namespace i2p
++
++#endif // METRICS_RENDERER_H__
+diff --git a/daemon/collectors/ClientCollector.cpp b/daemon/collectors/ClientCollector.cpp
+new file mode 100644
+index 00000000..ffbac28e
+--- /dev/null
++++ b/daemon/collectors/ClientCollector.cpp
+@@ -0,0 +1,63 @@
++#include "ClientCollector.h"
++#include "../../libi2pd_client/ClientContext.h"
++#include "../MetricsRenderer.h"
++#include <map>
++#include <string>
++
++namespace i2p {
++namespace metrics {
++void CollectClientMetrics(std::vector<MetricFamily> &families) {
++  // i2pd_client_destinations
++  MetricFamily destinations("i2pd_client_destinations", MetricType::Gauge,
++                            "Number of local client destinations");
++  destinations.AddMetric(
++      static_cast<double>(i2p::client::context.GetDestinations().size()));
++  families.push_back(std::move(destinations));
++
++  // i2pd_client_tunnels
++  MetricFamily tunnels("i2pd_client_tunnels", MetricType::Gauge,
++                       "Number of client tunnels by type");
++
++  std::map<std::string, std::string> clientLabels;
++  clientLabels["type"] = "client";
++  tunnels.AddMetric(
++      clientLabels,
++      static_cast<double>(i2p::client::context.GetClientTunnels().size()));
++
++  std::map<std::string, std::string> serverLabels;
++  serverLabels["type"] = "server";
++  tunnels.AddMetric(
++      serverLabels,
++      static_cast<double>(i2p::client::context.GetServerTunnels().size()));
++  families.push_back(std::move(tunnels));
++
++  // i2pd_client_udp_tunnels
++  MetricFamily udpTunnels("i2pd_client_udp_tunnels", MetricType::Gauge,
++                          "Number of UDP tunnels by type");
++
++  std::map<std::string, std::string> udpClientLabels;
++  udpClientLabels["type"] = "client";
++  udpTunnels.AddMetric(
++      udpClientLabels,
++      static_cast<double>(i2p::client::context.GetClientForwards().size()));
++
++  std::map<std::string, std::string> udpServerLabels;
++  udpServerLabels["type"] = "server";
++  udpTunnels.AddMetric(
++      udpServerLabels,
++      static_cast<double>(i2p::client::context.GetServerForwards().size()));
++  families.push_back(std::move(udpTunnels));
++
++  // i2pd_client_sam_sessions
++  MetricFamily samSessions("i2pd_client_sam_sessions", MetricType::Gauge,
++                           "Number of active SAM sessions");
++  auto samBridge = i2p::client::context.GetSAMBridge();
++  if (samBridge) {
++    samSessions.AddMetric(static_cast<double>(samBridge->GetSessions().size()));
++  } else {
++    samSessions.AddMetric(0.0);
++  }
++  families.push_back(std::move(samSessions));
++}
++} // namespace metrics
++} // namespace i2p
+diff --git a/daemon/collectors/ClientCollector.h b/daemon/collectors/ClientCollector.h
+new file mode 100644
+index 00000000..3cde527e
+--- /dev/null
++++ b/daemon/collectors/ClientCollector.h
+@@ -0,0 +1,14 @@
++#ifndef CLIENT_COLLECTOR_H__
++#define CLIENT_COLLECTOR_H__
++
++#include <vector>
++
++namespace i2p {
++namespace metrics {
++struct MetricFamily;
++
++void CollectClientMetrics(std::vector<MetricFamily> &families);
++} // namespace metrics
++} // namespace i2p
++
++#endif // CLIENT_COLLECTOR_H__
+diff --git a/daemon/collectors/NetDbCollector.cpp b/daemon/collectors/NetDbCollector.cpp
+new file mode 100644
+index 00000000..485903dc
+--- /dev/null
++++ b/daemon/collectors/NetDbCollector.cpp
+@@ -0,0 +1,28 @@
++#include "NetDbCollector.h"
++#include "../../libi2pd/NetDb.hpp"
++#include "../MetricsRenderer.h"
++
++namespace i2p {
++namespace metrics {
++void CollectNetDbMetrics(std::vector<MetricFamily> &families) {
++  // i2pd_netdb_routers
++  MetricFamily routers("i2pd_netdb_routers", MetricType::Gauge,
++                       "Number of known routers in NetDb");
++  routers.AddMetric(static_cast<double>(i2p::data::netdb.GetNumRouters()));
++  families.push_back(std::move(routers));
++
++  // i2pd_netdb_floodfills
++  MetricFamily floodfills("i2pd_netdb_floodfills", MetricType::Gauge,
++                          "Number of known floodfill routers");
++  floodfills.AddMetric(
++      static_cast<double>(i2p::data::netdb.GetNumFloodfills()));
++  families.push_back(std::move(floodfills));
++
++  // i2pd_netdb_leasesets
++  MetricFamily leasesets("i2pd_netdb_leasesets", MetricType::Gauge,
++                         "Number of known LeaseSets");
++  leasesets.AddMetric(static_cast<double>(i2p::data::netdb.GetNumLeaseSets()));
++  families.push_back(std::move(leasesets));
++}
++} // namespace metrics
++} // namespace i2p
+diff --git a/daemon/collectors/NetDbCollector.h b/daemon/collectors/NetDbCollector.h
+new file mode 100644
+index 00000000..aa5271e1
+--- /dev/null
++++ b/daemon/collectors/NetDbCollector.h
+@@ -0,0 +1,14 @@
++#ifndef NETDB_COLLECTOR_H__
++#define NETDB_COLLECTOR_H__
++
++#include <vector>
++
++namespace i2p {
++namespace metrics {
++struct MetricFamily;
++
++void CollectNetDbMetrics(std::vector<MetricFamily> &families);
++} // namespace metrics
++} // namespace i2p
++
++#endif // NETDB_COLLECTOR_H__
+diff --git a/daemon/collectors/RouterCollector.cpp b/daemon/collectors/RouterCollector.cpp
+new file mode 100644
+index 00000000..758ef413
+--- /dev/null
++++ b/daemon/collectors/RouterCollector.cpp
+@@ -0,0 +1,52 @@
++#include "RouterCollector.h"
++#include "../../libi2pd/RouterContext.h"
++#include "../../libi2pd/version.h"
++#include "../MetricsRenderer.h"
++#include <map>
++#include <string>
++
++namespace i2p {
++namespace metrics {
++void CollectRouterMetrics(std::vector<MetricFamily> &families) {
++  // i2pd_router_uptime_seconds
++  MetricFamily uptime("i2pd_router_uptime_seconds", MetricType::Gauge,
++                      "Router uptime in seconds");
++  uptime.AddMetric(static_cast<double>(i2p::context.GetUptime()));
++  families.push_back(std::move(uptime));
++
++  // i2pd_router_info
++  MetricFamily info("i2pd_router_info", MetricType::Info,
++                    "Router version information");
++  std::map<std::string, std::string> infoLabels;
++  infoLabels["version"] = I2PD_VERSION;
++  info.AddMetric(infoLabels, 1.0);
++  families.push_back(std::move(info));
++
++  // i2pd_router_bandwidth_limit_bytes
++  MetricFamily bandwidth("i2pd_router_bandwidth_limit_bytes", MetricType::Gauge,
++                         "Router bandwidth limit in bytes per second");
++  bandwidth.AddMetric(static_cast<double>(i2p::context.GetBandwidthLimit()));
++  families.push_back(std::move(bandwidth));
++
++  // i2pd_router_status
++  MetricFamily status("i2pd_router_status", MetricType::Gauge,
++                      "Router network status (0=OK, 1=Firewalled, 2=Unknown, "
++                      "3=Proxy, 4=Mesh, 5=Stan)");
++  std::map<std::string, std::string> statusLabels;
++  RouterStatus routerStatus = i2p::context.GetStatus();
++  statusLabels["status"] = ROUTER_STATUS_NAMES[routerStatus];
++  status.AddMetric(statusLabels, static_cast<double>(routerStatus));
++  families.push_back(std::move(status));
++
++  // i2pd_router_status_v6
++  MetricFamily statusV6("i2pd_router_status_v6", MetricType::Gauge,
++                        "Router IPv6 network status (0=OK, 1=Firewalled, "
++                        "2=Unknown, 3=Proxy, 4=Mesh, 5=Stan)");
++  std::map<std::string, std::string> statusV6Labels;
++  RouterStatus routerStatusV6 = i2p::context.GetStatusV6();
++  statusV6Labels["status"] = ROUTER_STATUS_NAMES[routerStatusV6];
++  statusV6.AddMetric(statusV6Labels, static_cast<double>(routerStatusV6));
++  families.push_back(std::move(statusV6));
++}
++} // namespace metrics
++} // namespace i2p
+diff --git a/daemon/collectors/RouterCollector.h b/daemon/collectors/RouterCollector.h
+new file mode 100644
+index 00000000..1e2a2163
+--- /dev/null
++++ b/daemon/collectors/RouterCollector.h
+@@ -0,0 +1,14 @@
++#ifndef ROUTER_COLLECTOR_H__
++#define ROUTER_COLLECTOR_H__
++
++#include <vector>
++
++namespace i2p {
++namespace metrics {
++struct MetricFamily;
++
++void CollectRouterMetrics(std::vector<MetricFamily> &families);
++} // namespace metrics
++} // namespace i2p
++
++#endif // ROUTER_COLLECTOR_H__
+diff --git a/daemon/collectors/TransportCollector.cpp b/daemon/collectors/TransportCollector.cpp
+new file mode 100644
+index 00000000..6ff92548
+--- /dev/null
++++ b/daemon/collectors/TransportCollector.cpp
+@@ -0,0 +1,111 @@
++#include "TransportCollector.h"
++#include "../../libi2pd/Transports.h"
++#include "../MetricsRenderer.h"
++#include <map>
++#include <string>
++
++namespace i2p {
++namespace metrics {
++void CollectTransportMetrics(std::vector<MetricFamily> &families) {
++  // i2pd_transport_peers_total
++  MetricFamily peersTotal("i2pd_transport_peers_total", MetricType::Gauge,
++                          "Total number of connected peers");
++  peersTotal.AddMetric(
++      static_cast<double>(i2p::transport::transports.GetNumPeers()));
++  families.push_back(std::move(peersTotal));
++
++  // i2pd_transport_peers by transport type
++  MetricFamily peers("i2pd_transport_peers", MetricType::Gauge,
++                     "Number of peers by transport type");
++
++  // Count NTCP2 peers
++  auto ntcp2Server = i2p::transport::transports.GetNTCP2Server();
++  if (ntcp2Server) {
++    std::map<std::string, std::string> ntcp2Labels;
++    ntcp2Labels["transport"] = "ntcp2";
++    peers.AddMetric(ntcp2Labels, static_cast<double>(
++                                     ntcp2Server->GetNTCP2Sessions().size()));
++  }
++
++  // Count SSU2 peers
++  auto ssu2Server = i2p::transport::transports.GetSSU2Server();
++  if (ssu2Server) {
++    std::map<std::string, std::string> ssu2Labels;
++    ssu2Labels["transport"] = "ssu2";
++    peers.AddMetric(ssu2Labels,
++                    static_cast<double>(ssu2Server->GetSSU2Sessions().size()));
++  }
++  families.push_back(std::move(peers));
++
++  // i2pd_transport_bytes_total
++  MetricFamily bytesTotal("i2pd_transport_bytes_total", MetricType::Counter,
++                          "Total bytes transferred");
++  std::map<std::string, std::string> sentLabels;
++  sentLabels["direction"] = "sent";
++  bytesTotal.AddMetric(
++      sentLabels,
++      static_cast<double>(i2p::transport::transports.GetTotalSentBytes()));
++
++  std::map<std::string, std::string> receivedLabels;
++  receivedLabels["direction"] = "received";
++  bytesTotal.AddMetric(
++      receivedLabels,
++      static_cast<double>(i2p::transport::transports.GetTotalReceivedBytes()));
++  families.push_back(std::move(bytesTotal));
++
++  // i2pd_transport_transit_bytes_total
++  MetricFamily transitBytes("i2pd_transport_transit_bytes_total",
++                            MetricType::Counter,
++                            "Total transit bytes transmitted");
++  transitBytes.AddMetric(static_cast<double>(
++      i2p::transport::transports.GetTotalTransitTransmittedBytes()));
++  families.push_back(std::move(transitBytes));
++
++  // i2pd_transport_bandwidth_bytes_per_second
++  MetricFamily bandwidth("i2pd_transport_bandwidth_bytes_per_second",
++                         MetricType::Gauge,
++                         "Current bandwidth in bytes per second");
++  std::map<std::string, std::string> inLabels;
++  inLabels["direction"] = "in";
++  bandwidth.AddMetric(
++      inLabels,
++      static_cast<double>(i2p::transport::transports.GetInBandwidth()));
++
++  std::map<std::string, std::string> outLabels;
++  outLabels["direction"] = "out";
++  bandwidth.AddMetric(
++      outLabels,
++      static_cast<double>(i2p::transport::transports.GetOutBandwidth()));
++
++  std::map<std::string, std::string> transitLabels;
++  transitLabels["direction"] = "transit";
++  bandwidth.AddMetric(
++      transitLabels,
++      static_cast<double>(i2p::transport::transports.GetTransitBandwidth()));
++  families.push_back(std::move(bandwidth));
++
++  // i2pd_transport_bandwidth_bytes_per_second_15s (short-term bandwidth)
++  MetricFamily bandwidth15s(
++      "i2pd_transport_bandwidth_bytes_per_second_15s", MetricType::Gauge,
++      "Bandwidth over last 15 seconds in bytes per second");
++  std::map<std::string, std::string> in15sLabels;
++  in15sLabels["direction"] = "in";
++  bandwidth15s.AddMetric(
++      in15sLabels,
++      static_cast<double>(i2p::transport::transports.GetInBandwidth15s()));
++
++  std::map<std::string, std::string> out15sLabels;
++  out15sLabels["direction"] = "out";
++  bandwidth15s.AddMetric(
++      out15sLabels,
++      static_cast<double>(i2p::transport::transports.GetOutBandwidth15s()));
++
++  std::map<std::string, std::string> transit15sLabels;
++  transit15sLabels["direction"] = "transit";
++  bandwidth15s.AddMetric(
++      transit15sLabels,
++      static_cast<double>(i2p::transport::transports.GetTransitBandwidth15s()));
++  families.push_back(std::move(bandwidth15s));
++}
++} // namespace metrics
++} // namespace i2p
+diff --git a/daemon/collectors/TransportCollector.h b/daemon/collectors/TransportCollector.h
+new file mode 100644
+index 00000000..60b11694
+--- /dev/null
++++ b/daemon/collectors/TransportCollector.h
+@@ -0,0 +1,14 @@
++#ifndef TRANSPORT_COLLECTOR_H__
++#define TRANSPORT_COLLECTOR_H__
++
++#include <vector>
++
++namespace i2p {
++namespace metrics {
++struct MetricFamily;
++
++void CollectTransportMetrics(std::vector<MetricFamily> &families);
++} // namespace metrics
++} // namespace i2p
++
++#endif // TRANSPORT_COLLECTOR_H__
+diff --git a/daemon/collectors/TunnelCollector.cpp b/daemon/collectors/TunnelCollector.cpp
+new file mode 100644
+index 00000000..14e39cee
+--- /dev/null
++++ b/daemon/collectors/TunnelCollector.cpp
+@@ -0,0 +1,52 @@
++#include "TunnelCollector.h"
++#include "../../libi2pd/Tunnel.h"
++#include "../MetricsRenderer.h"
++
++namespace i2p {
++namespace metrics {
++void CollectTunnelMetrics(std::vector<MetricFamily> &families) {
++  // i2pd_tunnels_participating
++  MetricFamily participating(
++      "i2pd_tunnels_participating", MetricType::Gauge,
++      "Number of tunnels this router is participating in");
++  participating.AddMetric(
++      static_cast<double>(i2p::tunnel::tunnels.CountTransitTunnels()));
++  families.push_back(std::move(participating));
++
++  // i2pd_tunnels_inbound
++  MetricFamily inbound("i2pd_tunnels_inbound", MetricType::Gauge,
++                       "Number of inbound tunnels");
++  inbound.AddMetric(
++      static_cast<double>(i2p::tunnel::tunnels.CountInboundTunnels()));
++  families.push_back(std::move(inbound));
++
++  // i2pd_tunnels_outbound
++  MetricFamily outbound("i2pd_tunnels_outbound", MetricType::Gauge,
++                        "Number of outbound tunnels");
++  outbound.AddMetric(
++      static_cast<double>(i2p::tunnel::tunnels.CountOutboundTunnels()));
++  families.push_back(std::move(outbound));
++
++  // i2pd_tunnels_queue_size
++  MetricFamily queue("i2pd_tunnels_queue_size", MetricType::Gauge,
++                     "Number of messages in tunnel processing queue");
++  queue.AddMetric(static_cast<double>(i2p::tunnel::tunnels.GetQueueSize()));
++  families.push_back(std::move(queue));
++
++  // i2pd_tunnels_build_queue_size
++  MetricFamily buildQueue("i2pd_tunnels_build_queue_size", MetricType::Gauge,
++                          "Number of messages in tunnel build queue");
++  buildQueue.AddMetric(
++      static_cast<double>(i2p::tunnel::tunnels.GetTBMQueueSize()));
++  families.push_back(std::move(buildQueue));
++
++  // i2pd_tunnels_creation_success_rate
++  MetricFamily successRate("i2pd_tunnels_creation_success_rate",
++                           MetricType::Gauge,
++                           "Tunnel creation success rate (0-100)");
++  successRate.AddMetric(
++      i2p::tunnel::tunnels.GetPreciseTunnelCreationSuccessRate());
++  families.push_back(std::move(successRate));
++}
++} // namespace metrics
++} // namespace i2p
+diff --git a/daemon/collectors/TunnelCollector.h b/daemon/collectors/TunnelCollector.h
+new file mode 100644
+index 00000000..c69e09c7
+--- /dev/null
++++ b/daemon/collectors/TunnelCollector.h
+@@ -0,0 +1,14 @@
++#ifndef TUNNEL_COLLECTOR_H__
++#define TUNNEL_COLLECTOR_H__
++
++#include <vector>
++
++namespace i2p {
++namespace metrics {
++struct MetricFamily;
++
++void CollectTunnelMetrics(std::vector<MetricFamily> &families);
++} // namespace metrics
++} // namespace i2p
++
++#endif // TUNNEL_COLLECTOR_H__
+diff --git a/filelist.mk b/filelist.mk
+index d8f503e6..df77ab9b 100644
+--- a/filelist.mk
++++ b/filelist.mk
+@@ -23,4 +23,4 @@ LANG_SRC = $(wildcard $(LANG_SRC_DIR)/*.cpp)
+ 
+ WRAP_LIB_SRC = $(wildcard $(WRAP_SRC_DIR)/*.cpp)
+ 
+-DAEMON_SRC = $(wildcard $(DAEMON_SRC_DIR)/*.cpp)
++DAEMON_SRC = $(wildcard $(DAEMON_SRC_DIR)/*.cpp) $(wildcard $(DAEMON_SRC_DIR)/collectors/*.cpp)
+diff --git a/libi2pd/Config.cpp b/libi2pd/Config.cpp
+index 0cd99c0b..755d80cc 100644
+--- a/libi2pd/Config.cpp
++++ b/libi2pd/Config.cpp
+@@ -380,6 +380,13 @@ namespace config {
+ 		;
+ #endif
+ 
++		options_description metrics("Metrics options");
++		metrics.add_options()
++			("metrics.enabled", value<bool>()->default_value(false),             "Enable or disable Prometheus/OpenMetrics endpoint")
++			("metrics.address", value<std::string>()->default_value("127.0.0.1"), "Metrics listen address")
++			("metrics.port",    value<uint16_t>()->default_value(9600),           "Metrics listen port")
++		;
++
+ 		m_OptionsDesc
+ 			.add(general)
+ 			.add(limits)
+@@ -403,6 +410,7 @@ namespace config {
+ 			.add(nettime)
+ 			.add(persist)
+ 			.add(cpuext)
++			.add(metrics)
+ 			.add(meshnets)
+ #ifdef __linux__
+ 			.add(unix_specific)

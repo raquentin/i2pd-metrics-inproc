@@ -1,0 +1,66 @@
+# Dockerfile.test - Integration test for i2pd with metrics patch
+#
+# This builds i2pd 2.59.0 with the metrics patch applied and runs integration tests
+
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libboost-system-dev \
+    libboost-date-time-dev \
+    libboost-filesystem-dev \
+    libboost-program-options-dev \
+    libssl-dev \
+    zlib1g-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Clone i2pd at tag 2.59.0
+RUN git clone --depth 1 --branch 2.59.0 https://github.com/PurpleI2P/i2pd.git
+
+# Copy the patch
+COPY i2pd-metrics.patch /build/
+
+# Apply the patch
+WORKDIR /build/i2pd
+RUN git apply /build/i2pd-metrics.patch
+
+# Build i2pd
+RUN make -j$(nproc)
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    libboost-system1.74.0 \
+    libboost-date-time1.74.0 \
+    libboost-filesystem1.74.0 \
+    libboost-program-options1.74.0 \
+    libssl3 \
+    zlib1g \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/i2pd
+
+# Copy binary and config from builder
+COPY --from=builder /build/i2pd/i2pd /opt/i2pd/
+COPY --from=builder /build/i2pd/contrib/i2pd.conf /opt/i2pd/i2pd.conf
+
+RUN mkdir -p /var/lib/i2pd
+
+EXPOSE 9600
+
+# Health check that validates metrics endpoint responds
+HEALTHCHECK --interval=2s --timeout=3s --start-period=5s --retries=10 \
+    CMD curl -f http://localhost:9600/metrics >/dev/null 2>&1 || exit 1
+
+# Pass metrics config via command-line to avoid sed-ing the shared config file
+CMD ["/opt/i2pd/i2pd", \
+     "--conf=/opt/i2pd/i2pd.conf", \
+     "--datadir=/var/lib/i2pd", \
+     "--metrics.enabled=1", \
+     "--metrics.address=0.0.0.0", \
+     "--metrics.port=9600"]
